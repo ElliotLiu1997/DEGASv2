@@ -159,10 +159,10 @@ plot_list <- plot_result("DEGASCREAD_Pat_Diff_2025-04-24", CREAD_result, sc_data
 plot_list$boxplot
 ```
 
-![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-1.png)
+![](DEGAS_AD_files/figure/unnamed-chunk-7-1.png)
 
 ``` r
 plot_list$umap
 ```
 
-![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-2.png)
+![](DEGAS_AD_files/figure/unnamed-chunk-7-2.png)
