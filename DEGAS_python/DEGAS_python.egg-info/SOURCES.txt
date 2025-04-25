@@ -1,0 +1,16 @@
+setup.py
+DEGAS_python/__init__.py
+DEGAS_python/options.py
+DEGAS_python/run_module.py
+DEGAS_python.egg-info/PKG-INFO
+DEGAS_python.egg-info/SOURCES.txt
+DEGAS_python.egg-info/dependency_links.txt
+DEGAS_python.egg-info/top_level.txt
+DEGAS_python/datasets/__init__.py
+DEGAS_python/datasets/dataset.py
+DEGAS_python/datasets/graph_dataset_to_do.py
+DEGAS_python/datasets/tools.py
+DEGAS_python/models/__init__.py
+DEGAS_python/models/base_model.py
+DEGAS_python/models/func_models.py
+DEGAS_python/models/losses.py

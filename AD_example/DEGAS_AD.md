@@ -1,0 +1,181 @@
+---
+title: "DEGASv2 AD Example"
+output:
+  md_document:
+    variant: markdown_github
+    preserve_yaml: true
+---
+
+# Load required packages
+
+``` r
+library(Seurat)
+library(reticulate)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(GGally)
+library(stringr)
+library(DESeq2)
+library(DEGASv2)
+library(rstatix)
+library(Matrix)
+library(ggpubr)
+library(plotly)
+```
+
+# Load the scRNA-seq data
+
+``` r
+sc_raw_data <- read.csv("scDat.csv", header = TRUE, row.names = 1, sep = ",")
+scMeta <- read.csv("scLab.csv", header = TRUE, row.names = 1, sep = ",")
+createSCobj(sc_raw_data, "scRNA", scMeta, results_save_dir = "DEGAS")
+```
+
+    ## Modularity Optimizer version 1.3.0 by Ludo Waltman and Nees Jan van Eck
+    ## 
+    ## Number of nodes: 10807
+    ## Number of edges: 363473
+    ## 
+    ## Running Louvain algorithm...
+    ## Maximum modularity in 10 random starts: 0.9176
+    ## Number of communities: 11
+    ## Elapsed time: 1 seconds
+
+# Load the patient data
+
+``` r
+bulk_dataset <- read.csv("patDat.csv", header = TRUE, row.names = 1)
+patMeta <- read.csv("patLab.csv", header = TRUE, row.names = 1)
+phenotype_df <- data.frame(CERAD = as.integer(patMeta$CERAD <= 2), 
+                        Braak = as.integer(patMeta$Braak >= 5),
+                        CDR = as.integer(patMeta$CDR >= 3))
+```
+
+# Run model for different criterions
+
+``` r
+sc_dataset <- readRDS("DEGAS/SC_raw_counts/scRNA.rds")
+n_st_classes = length(unique(sc_dataset$oupSample.cellType))
+# use CERAD for test
+label = "CERAD"
+
+DEGAS_preprocessing(bulk_dataset, phenotype_df[, label], sc_dataset, paste0("DEGAS/", label), st_lab_list = sc_dataset@meta.data$oupSample.cellType, model_type = "categorical", diff_expr_files = c("DEGAS/SC_raw_counts/sc_diff_expr.csv"))
+```
+
+    ## No Coordinate exist, save meta dataNo Coordinate exist, save meta dataNo Coordinate exist, save meta data
+
+``` r
+for (feature in c("Pat_Diff")) {
+    folder_path <- paste0("DEGAS", label, "_", feature, "_", Sys.Date())
+    degas_sc_results <- run_DEGAS_SCST(paste0("DEGAS/", label, "/", feature, ".RData"), "ClassClass", "Grubman_MSBB", "cross_entropy", "Wasserstein", folder_path, tot_seeds = 10)
+    hazard_df <- as.data.frame(degas_sc_results[2])[, c("hazard_df.oupSample.cellType", "hazard_df.hazard", "hazard_df.oupSample.batchCond")]
+    colnames(hazard_df) <- c("cellType", "hazard", "batchCond")
+    hazard_df <- hazard_df %>% mutate(batchCond = ifelse(batchCond == "AD", "AD", ifelse(batchCond == "ct", "NC", batchCond)))
+    write.csv(hazard_df, paste0(folder_path, "/results.csv"))
+}
+```
+
+    ## Run submodel 0...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_0/configs.json
+    ## load models on cuda:0
+    ## Run submodel 1...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_1/configs.json
+    ## load models on cuda:0
+    ## Run submodel 2...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_2/configs.json
+    ## load models on cuda:0
+    ## Run submodel 3...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_3/configs.json
+    ## load models on cuda:0
+    ## Run submodel 4...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_4/configs.json
+    ## load models on cuda:0
+    ## Run submodel 5...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_5/configs.json
+    ## load models on cuda:0
+    ## Run submodel 6...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_6/configs.json
+    ## load models on cuda:0
+    ## Run submodel 7...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_7/configs.json
+    ## load models on cuda:0
+    ## Run submodel 8...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_8/configs.json
+    ## load models on cuda:0
+    ## Run submodel 9...
+    ## Load ClassClass model...
+    ## save the configurations into DEGASCERAD_Pat_Diff_2025-04-25/fold_-1_random_seed_9/configs.json
+    ## load models on cuda:0
+    ## Finish Run and Eval all models
+    ## Aggregate all results
+
+# Visualize the Result
+
+``` r
+plot_result <- function(folder_path, hazard_df, sc_dataset) {
+  anno_df <- compare_means(hazard ~ batchCond, group.by = "cellType", data = hazard_df) %>%
+  mutate(y_pos = 1.1)
+
+  ggplot1 <- ggplot(hazard_df, aes(x = batchCond, y = hazard, fill = batchCond)) + 
+    geom_boxplot(position = position_dodge()) + 
+    ylim(0, 1.2) + 
+    scale_fill_manual(values = c("AD" = "firebrick", "NC" = "steelblue")) + 
+    facet_wrap(~cellType, nrow = 2) + 
+    stat_compare_means(method = "wilcox.test", label = "p.signif") +
+    labs(x = "Batch Condition", y = "DEGAS Hazard", fill = "Batch Condition") + 
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold")
+    )
+
+  print(ggplot1)
+
+  umap_data <- Embeddings(sc_dataset, reduction = "umap")
+  umap_df <- as.data.frame(umap_data)
+  colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+  umap_df$cell <- rownames(umap_df)
+
+  hazard_df$cell <- rownames(hazard_df)
+  umap_merged <- left_join(umap_df, hazard_df[, c("cell", "hazard", "cellType")], by = "cell")
+
+  ggplot2 <- ggplot(umap_merged, aes(x = UMAP_1, y = UMAP_2, color = hazard, shape = cellType)) +
+    geom_point(size = 1.5) +
+    scale_color_gradient2(
+      midpoint = 0.5, low = "black", mid = "gray", high = "red",
+      limits = c(0, 1), space = "Lab"
+    ) +
+    labs(
+      title = "UMAP Plot",
+      x = "UMAP 1", y = "UMAP 2", color = "Hazard", shape = "Cell Type"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold")
+    )
+  print(ggplot2)
+}
+```
+
+``` r
+CREAD_result <- read.csv("DEGASCERAD_Pat_Diff_2025-04-24/results.csv", row.names = 1)
+plot_result("DEGASCREAD_Pat_Diff_2025-04-24", CREAD_result, sc_dataset)
+```
+
+![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-1.png)![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-2.png)

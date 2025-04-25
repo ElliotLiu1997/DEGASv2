@@ -1,0 +1,24 @@
+---
+title: "test_R_python_app"
+output: html_document
+date: "2023-09-26"
+---
+
+```{r}
+# Load and activate the Conda environment (as described in previous responses)
+library(reticulate)
+conda_env <- "/N/u/zli8/Carbonate/.conda/envs/newconda23"
+use_condaenv(condaenv = conda_env, required = TRUE)
+
+# Load your Python package
+py_module <- import("mypackage")
+
+# Use functions from module1 and module2
+result_add <- py_module$add_numbers(3, 4)
+result_multiply <- py_module$multiply_numbers(5, 6)
+
+# Print the results
+print(paste("Addition Result:", result_add))
+print(paste("Multiplication Result:", result_multiply))
+
+```
