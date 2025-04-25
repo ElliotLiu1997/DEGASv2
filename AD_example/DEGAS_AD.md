@@ -172,10 +172,10 @@ plot_list <- plot_result(CREAD_result, sc_dataset)
 plot_list$boxplot
 ```
 
-![](figure/box.pdf)
+![](figure/box.png)
 
 ``` r
 plot_list$umap
 ```
 
-![](figure/umap.pdf)
+![](figure/umap.png)
