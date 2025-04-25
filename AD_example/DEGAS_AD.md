@@ -104,65 +104,78 @@ for (feature in c("Pat_Diff")) {
 # Visualize the Result
 
 ``` r
-plot_result <- function(folder_path, hazard_df, sc_dataset) {
-  anno_df <- compare_means(hazard ~ batchCond, group.by = "cellType", data = hazard_df) %>%
-  mutate(y_pos = 1.1)
-# boxplot
+plot_result <- function(hazard_df, sc_dataset) {
+
+  # Boxplot
   ggplot1 <- ggplot(hazard_df, aes(x = batchCond, y = hazard, fill = batchCond)) + 
-    geom_boxplot(position = position_dodge()) + 
-    ylim(0, 1.2) + 
-    scale_fill_manual(values = c("AD" = "firebrick", "NC" = "steelblue")) + 
-    facet_wrap(~cellType, nrow = 2) + 
-    stat_compare_means(method = "wilcox.test", label = "p.signif") +
-    labs(x = "Batch Condition", y = "DEGAS Hazard", fill = "Batch Condition") + 
+    geom_boxplot(position = position_dodge(), width = 0.6, outlier.shape = NA) + 
+    scale_fill_manual(values = c("AD" = "#D73027", "NC" = "#4575B4")) +
+    ylim(0, 1.2) +
+    facet_wrap(~cellType, nrow = 2) +
+    labs(
+      title = "DEGAS Hazard Score by Cell Type",
+      x = "Batch Condition",
+      y = "Hazard Score",
+      fill = "Condition"
+    ) +
     theme_minimal(base_size = 14) +
     theme(
-      axis.title = element_text(face = "bold"),
-      axis.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      axis.title = element_text(face = "bold", size = 13),
+      axis.text = element_text(size = 11),
       strip.text = element_text(face = "bold"),
       legend.title = element_text(face = "bold"),
-      legend.text = element_text(face = "bold")
+      legend.text = element_text(size = 11)
     )
-#umap plot
+
+  # UMAP
   umap_data <- Embeddings(sc_dataset, reduction = "umap")
   umap_df <- as.data.frame(umap_data)
   colnames(umap_df) <- c("UMAP_1", "UMAP_2")
   umap_df$cell <- rownames(umap_df)
 
   hazard_df$cell <- rownames(hazard_df)
-  umap_merged <- left_join(umap_df, hazard_df[, c("cell", "hazard", "cellType")], by = "cell")
+  umap_merged <- left_join(
+    umap_df, 
+    hazard_df[, c("cell", "hazard", "cellType")], 
+    by = "cell"
+  )
 
   ggplot2 <- ggplot(umap_merged, aes(x = UMAP_1, y = UMAP_2, color = hazard, shape = cellType)) +
-    geom_point(size = 1.5) +
+    geom_point(size = 1.4) +
     scale_color_gradient2(
-      midpoint = 0.5, low = "black", mid = "gray", high = "red",
-      limits = c(0, 1), space = "Lab"
+      low = "#000000", mid = "#999999", high = "#D73027", midpoint = 0.5,
+      limits = c(0, 1), name = "Hazard"
     ) +
     labs(
-      title = "UMAP Plot",
-      x = "UMAP 1", y = "UMAP 2", color = "Hazard", shape = "Cell Type"
+      title = "UMAP Colored by DEGAS Hazard",
+      x = "UMAP 1",
+      y = "UMAP 2",
+      shape = "Cell Type"
     ) +
     theme_minimal(base_size = 14) +
     theme(
-      axis.title = element_text(face = "bold"),
-      axis.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      axis.title = element_text(face = "bold", size = 13),
+      axis.text = element_text(size = 11),
       legend.title = element_text(face = "bold"),
-      legend.text = element_text(face = "bold")
+      legend.text = element_text(size = 11)
     )
+
   list(boxplot = ggplot1, umap = ggplot2)
 }
 ```
 
 ``` r
-CREAD_result <- read.csv("DEGASCERAD_Pat_Diff_2025-04-24/results.csv", row.names = 1)
-plot_list <- plot_result("DEGASCREAD_Pat_Diff_2025-04-24", CREAD_result, sc_dataset)
+CREAD_result <- read.csv("DEGASCERAD_Pat_Diff_2025-04-25/results.csv", row.names = 1)
+plot_list <- plot_result(CREAD_result, sc_dataset)
 plot_list$boxplot
 ```
 
-![](figure/unnamed-chunk-7-1.png)
+![](figure/box.pdf)
 
 ``` r
 plot_list$umap
 ```
 
-![](figure/unnamed-chunk-7-2.png)
+![](figure/umap.pdf)
