@@ -1,11 +1,3 @@
----
-title: "DEGASv2 AD Example"
-output:
-  md_document:
-    variant: markdown_github
-    preserve_yaml: true
----
-
 # Load required packages
 
 ``` r
@@ -31,16 +23,6 @@ sc_raw_data <- read.csv("scDat.csv", header = TRUE, row.names = 1, sep = ",")
 scMeta <- read.csv("scLab.csv", header = TRUE, row.names = 1, sep = ",")
 createSCobj(sc_raw_data, "scRNA", scMeta, results_save_dir = "DEGAS")
 ```
-
-    ## Modularity Optimizer version 1.3.0 by Ludo Waltman and Nees Jan van Eck
-    ## 
-    ## Number of nodes: 10807
-    ## Number of edges: 363473
-    ## 
-    ## Running Louvain algorithm...
-    ## Maximum modularity in 10 random starts: 0.9176
-    ## Number of communities: 11
-    ## Elapsed time: 1 seconds
 
 # Load the patient data
 
@@ -125,7 +107,7 @@ for (feature in c("Pat_Diff")) {
 plot_result <- function(folder_path, hazard_df, sc_dataset) {
   anno_df <- compare_means(hazard ~ batchCond, group.by = "cellType", data = hazard_df) %>%
   mutate(y_pos = 1.1)
-
+# boxplot
   ggplot1 <- ggplot(hazard_df, aes(x = batchCond, y = hazard, fill = batchCond)) + 
     geom_boxplot(position = position_dodge()) + 
     ylim(0, 1.2) + 
@@ -141,9 +123,7 @@ plot_result <- function(folder_path, hazard_df, sc_dataset) {
       legend.title = element_text(face = "bold"),
       legend.text = element_text(face = "bold")
     )
-
-  print(ggplot1)
-
+#umap plot
   umap_data <- Embeddings(sc_dataset, reduction = "umap")
   umap_df <- as.data.frame(umap_data)
   colnames(umap_df) <- c("UMAP_1", "UMAP_2")
@@ -169,13 +149,20 @@ plot_result <- function(folder_path, hazard_df, sc_dataset) {
       legend.title = element_text(face = "bold"),
       legend.text = element_text(face = "bold")
     )
-  print(ggplot2)
+  list(boxplot = ggplot1, umap = ggplot2)
 }
 ```
 
 ``` r
 CREAD_result <- read.csv("DEGASCERAD_Pat_Diff_2025-04-24/results.csv", row.names = 1)
-plot_result("DEGASCREAD_Pat_Diff_2025-04-24", CREAD_result, sc_dataset)
+plot_list <- plot_result("DEGASCREAD_Pat_Diff_2025-04-24", CREAD_result, sc_dataset)
+plot_list$boxplot
 ```
 
-![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-1.png)![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-2.png)
+![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-1.png)
+
+``` r
+plot_list$umap
+```
+
+![](DEGAS_AD_files/figure-markdown_github/unnamed-chunk-7-2.png)
