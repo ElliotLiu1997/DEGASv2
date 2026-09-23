@@ -1,0 +1,1298 @@
+---
+title: "DEGASv2 Simulation Example"
+output:
+  md_document:
+    variant: markdown_github
+    preserve_yaml: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/N/project/ADNDD/Foundation/DEGAS_torch/simulation")
+```
+
+```{r, include=FALSE}
+.libPaths("/geode2/home/u040/jl370/Carbonate/R_libs")
+Sys.setenv(LD_LIBRARY_PATH = "/N/soft/rhel8/deeplearning/Python-3.10.10/lib:$LD_LIBRARY_PATH")
+library("reticulate")
+use_python("/N/soft/rhel8/deeplearning/Python-3.10.10/python", required = TRUE)
+py_config()
+DEGAS_python <- import("DEGAS_python")
+```
+
+# Load required packages
+
+```{r, message=FALSE, warning=FALSE}
+library(Seurat)
+library(reticulate)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(DESeq2)
+library(DEGASv2)
+library(rstatix)
+library(Matrix)
+library(ggpubr)
+library(plotly)
+```
+
+```{r}
+calc_auroc <- function(score, label) {
+  ok <- !is.na(score) & !is.na(label)
+  score <- score[ok]
+  label <- as.integer(label[ok])
+
+  n_pos <- sum(label == 1)
+  n_neg <- sum(label == 0)
+
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+
+  r <- rank(score, ties.method = "average")
+  auc <- (sum(r[label == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+  as.numeric(auc)
+}
+
+calc_auprc <- function(score, label) {
+  ok <- !is.na(score) & !is.na(label)
+  score <- score[ok]
+  label <- as.integer(label[ok])
+
+  if (sum(label == 1) == 0) return(NA_real_)
+
+  ord <- order(score, decreasing = TRUE)
+  label <- label[ord]
+
+  tp <- cumsum(label == 1)
+  fp <- cumsum(label == 0)
+
+  precision <- tp / (tp + fp)
+  recall <- tp / sum(label == 1)
+
+  recall_prev <- c(0, recall[-length(recall)])
+  auprc <- sum((recall - recall_prev) * precision)
+
+  as.numeric(auprc)
+}
+
+calc_top10_enrichment <- function(score, label) {
+  ok <- !is.na(score) & !is.na(label)
+  score <- score[ok]
+  label <- as.integer(label[ok])
+
+  n_top <- ceiling(length(score) * 0.10)
+  top_idx <- order(score, decreasing = TRUE)[seq_len(n_top)]
+
+  top_rate <- mean(label[top_idx] == 1)
+  base_rate <- mean(label == 1)
+
+  data.frame(
+    top10_true_risk_fraction = top_rate,
+    baseline_true_risk_fraction = base_rate,
+    top10_enrichment = top_rate / base_rate
+  )
+}
+
+extract_degas_score <- function(degas_result, n_cells) {
+  if ("index" %in% colnames(degas_result)) {
+    idx <- as.integer(degas_result$index)
+
+    # DEGAS_python usually returns 0-based index
+    if (min(idx, na.rm = TRUE) == 0) {
+      idx <- idx + 1
+    }
+
+    score <- rep(NA_real_, n_cells)
+    score[idx] <- degas_result$hazard
+    return(score)
+  }
+
+  if ("hazard" %in% colnames(degas_result)) {
+    return(degas_result$hazard)
+  }
+
+  stop("Cannot find hazard/index columns in DEGAS result.")
+}
+```
+
+### scRNA-seq
+```{r}
+simulate_sc_counts <- function(
+    scenario = c("sim1_major_type", "sim2_subtype", "sim3_type4"),
+    n_genes = 1000,
+    n_cells = 3000,
+    dropout_strength = 0.55,
+    signal_strength = 0.45,
+    seed = 1
+) {
+  scenario <- match.arg(scenario)
+  set.seed(seed)
+
+  genes <- paste0("Gene", seq_len(n_genes))
+
+  groups <- c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease")
+
+  n_per_group <- rep(floor(n_cells / length(groups)), length(groups))
+  n_per_group[1] <- n_per_group[1] + n_cells - sum(n_per_group)
+
+  base_log_mu <- rnorm(n_genes, mean = 1.2, sd = 0.8)
+
+  group_log_mu <- matrix(base_log_mu, nrow = n_genes, ncol = length(groups))
+  rownames(group_log_mu) <- genes
+  colnames(group_log_mu) <- groups
+
+  major_marker_map <- list(
+    Type1 = 1:80,
+    Type2 = 81:160,
+    Type3 = 161:240,
+    Type4 = 241:320
+  )
+
+  group_to_major <- c(
+    Type1 = "Type1",
+    Type2 = "Type2",
+    Type3 = "Type3",
+    Type4_normal = "Type4",
+    Type4_disease = "Type4"
+  )
+
+  for (group_name in groups) {
+    major_name <- group_to_major[[group_name]]
+    marker_genes <- major_marker_map[[major_name]]
+    marker_genes <- marker_genes[marker_genes <= n_genes]
+
+    group_log_mu[marker_genes, group_name] <-
+      group_log_mu[marker_genes, group_name] + signal_strength
+  }
+
+  disease_genes <- 401:500
+  disease_genes <- disease_genes[disease_genes <= n_genes]
+  group_log_mu[disease_genes, "Type4_disease"] <-
+    group_log_mu[disease_genes, "Type4_disease"] + signal_strength
+
+  counts_list <- list()
+  meta_list <- list()
+  cell_counter <- 1
+
+  for (g in seq_along(groups)) {
+    group_name <- groups[g]
+    n_g <- n_per_group[g]
+
+    mu <- exp(group_log_mu[, g])
+
+    mat <- matrix(0, nrow = n_genes, ncol = n_g)
+
+    for (j in seq_len(n_g)) {
+      lib_factor <- exp(rnorm(1, mean = 0, sd = 0.35))
+      mu_j <- mu * lib_factor
+
+      x <- rnbinom(n_genes, mu = mu_j, size = 3)
+
+      p_drop <- dropout_strength * exp(-log1p(x) / 2)
+      drop <- runif(n_genes) < p_drop
+      x[drop] <- 0
+
+      mat[, j] <- x
+    }
+
+    cell_names <- paste0("Cell", cell_counter:(cell_counter + n_g - 1))
+    colnames(mat) <- cell_names
+    rownames(mat) <- genes
+
+    counts_list[[group_name]] <- mat
+
+    major_type <- ifelse(grepl("Type4", group_name), "Type4", group_name)
+
+    meta_list[[group_name]] <- data.frame(
+      cell = cell_names,
+      group = group_name,
+      cellType = major_type,
+      stringsAsFactors = FALSE
+    )
+
+    cell_counter <- cell_counter + n_g
+  }
+
+  sc_counts <- do.call(cbind, counts_list)
+  sc_meta <- do.call(rbind, meta_list)
+  rownames(sc_meta) <- sc_meta$cell
+
+  if (scenario == "sim1_major_type") {
+    sc_meta$true_risk <- as.integer(sc_meta$cellType == "Type1")
+  } else if (scenario == "sim2_subtype") {
+    sc_meta$true_risk <- as.integer(sc_meta$group == "Type4_disease")
+  } else if (scenario == "sim3_type4") {
+    sc_meta$true_risk <- as.integer(sc_meta$cellType == "Type4")
+  }
+
+  list(
+    sc_counts = sc_counts,
+    sc_meta = sc_meta
+  )
+}
+```
+
+### bulk
+```{r}
+simulate_bulk_from_sc <- function(
+    sc_counts,
+    sc_meta,
+    scenario,
+    n_patients = 200,
+    cells_per_patient = 400,
+    domain_shift_sd = 0.8,
+    patient_noise_sd = 0.35,
+    seed = 101
+) {
+  set.seed(seed)
+
+  genes <- rownames(sc_counts)
+
+  phenotype <- c(rep(1, n_patients / 2), rep(0, n_patients / 2))
+  patient_names <- paste0("Patient", seq_len(n_patients))
+
+  bulk_counts <- matrix(0, nrow = nrow(sc_counts), ncol = n_patients)
+  rownames(bulk_counts) <- genes
+  colnames(bulk_counts) <- patient_names
+
+  ## global bulk-vs-sc systematic domain shift
+  ## this is independent of disease status
+  bulk_domain_shift <- exp(rnorm(nrow(sc_counts), mean = 0, sd = domain_shift_sd))
+
+  ## systematic bias genes unrelated to true risk
+  ## this makes no-transfer more likely to be distracted
+  bias_genes <- 601:750
+  bias_vector <- rep(1, nrow(sc_counts))
+  bias_vector[bias_genes] <- exp(0.8)
+
+  sample_cells <- function(prob_by_group) {
+    prob_by_group <- prob_by_group / sum(prob_by_group)
+    expected_n <- cells_per_patient * prob_by_group
+    n_by_group <- floor(expected_n)
+    remainder <- cells_per_patient - sum(n_by_group)
+
+    if (remainder > 0) {
+      add_idx <- order(expected_n - n_by_group, decreasing = TRUE)[seq_len(remainder)]
+      n_by_group[add_idx] <- n_by_group[add_idx] + 1
+    }
+
+    sampled_cells <- c()
+
+    for (grp in names(prob_by_group)) {
+      n_grp <- n_by_group[[grp]]
+      if (n_grp == 0) next
+
+      candidates <- sc_meta$cell[
+        sc_meta$group == grp | sc_meta$cellType == grp
+      ]
+
+      sampled_cells <- c(
+        sampled_cells,
+        sample(candidates, n_grp, replace = TRUE)
+      )
+    }
+
+    sampled_cells
+  }
+
+  for (i in seq_len(n_patients)) {
+    is_disease <- phenotype[i] == 1
+
+    if (scenario == "sim1_major_type") {
+      if (is_disease) {
+        probs <- c(
+          Type1 = 0.35,
+          Type2 = 0.216,
+          Type3 = 0.216,
+          Type4_normal = 0.218,
+          Type4_disease = 0.00
+        )
+      } else {
+        probs <- c(
+          Type1 = 0.25,
+          Type2 = 0.25,
+          Type3 = 0.25,
+          Type4_normal = 0.25,
+          Type4_disease = 0.00
+        )
+      }
+    }
+
+    if (scenario == "sim2_subtype") {
+      if (is_disease) {
+        probs <- c(
+          Type1 = 0.25,
+          Type2 = 0.25,
+          Type3 = 0.25,
+          Type4_normal = 0.05,
+          Type4_disease = 0.2
+        )
+      } else {
+        probs <- c(
+          Type1 = 0.25,
+          Type2 = 0.25,
+          Type3 = 0.25,
+          Type4_normal = 0.25,
+          Type4_disease = 0.00
+        )
+      }
+    }
+
+    if (scenario == "sim3_type4") {
+      if (is_disease) {
+        probs <- c(
+          Type1 = 0.2,
+          Type2 = 0.2,
+          Type3 = 0.2,
+          Type4_normal = 0.25,
+          Type4_disease = 0.15
+        )
+      } else {
+        probs <- c(
+          Type1 = 0.25,
+          Type2 = 0.25,
+          Type3 = 0.25,
+          Type4_normal = 0.25,
+          Type4_disease = 0.00
+        )
+      }
+    }
+
+    cells <- sample_cells(probs)
+
+    x <- rowSums(sc_counts[, cells, drop = FALSE])
+
+    ## apply systematic bulk domain shift
+    x <- x * bulk_domain_shift
+
+    ## apply unrelated patient-level bias
+    x <- x * bias_vector
+
+    ## patient-specific noise
+    patient_shift <- exp(rnorm(length(x), mean = 0, sd = patient_noise_sd))
+    x <- x * patient_shift
+
+    ## count noise
+    noise <- rnorm(length(x), mean = 0, sd = sqrt(pmax(x, 1)))
+    x <- round(pmax(0, x + noise))
+
+    bulk_counts[, i] <- x
+  }
+
+  list(
+    bulk_counts = bulk_counts,
+    phenotype = phenotype
+  )
+}
+```
+
+
+### one run
+```{r}
+run_one_degas_method <- function(
+    sc_counts,
+    sc_meta,
+    bulk_counts,
+    phenotype,
+    scenario,
+    method_name,
+    transfer_type,
+    lambda3,
+    num_layers = 3,
+    tot_seeds = 1,
+    save_root = "simulation_runs"
+) {
+  cat("Preprocessing:", scenario, method_name, "\n")
+
+  data <- DEGAS_preprocessing(
+    scst_list = sc_counts,
+    sclab = sc_meta$cellType,
+    patdata = bulk_counts,
+    phenotype = phenotype,
+    bulk_hvg = FALSE,
+    bulk_de = FALSE,
+    sc_de = FALSE,
+    add_genes = rownames(sc_counts)
+  )
+
+  # run_DEGAS_SCST reads this global variable
+  n_st_classes <<- length(unique(sc_meta$cellType))
+
+  save_dir <- file.path(save_root, scenario, method_name)
+  dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cat("Running DEGASv2:", scenario, method_name, "\n")
+
+  degas_sc_results <- run_DEGAS_SCST(
+    data_list = data,
+    model_type = "ClassClass",
+    data_name = paste0("simulation_", scenario, "_", method_name),
+    loss_type = "cross_entropy",
+    transfer_type = transfer_type,
+    num_layers = num_layers,
+    lambda3 = lambda3,
+    model_save_dir = save_dir,
+    tot_seeds = tot_seeds
+  )
+
+  score <- extract_degas_score(degas_sc_results, nrow(sc_meta))
+
+  data.frame(
+    cell = sc_meta$cell,
+    scenario = scenario,
+    method = method_name,
+    score = score,
+    true_risk = sc_meta$true_risk,
+    cellType = sc_meta$cellType,
+    group = sc_meta$group,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+### simulation scenario
+```{r}
+run_one_scenario <- function(
+    scenario,
+    seed = 1,
+    tot_seeds = 1,
+    num_layers = 3
+) {
+  cat("Generating scenario:", scenario, "\n")
+
+  sc <- simulate_sc_counts(
+    scenario = scenario,
+    n_genes = 1000,
+    n_cells = 3000,
+    dropout_strength = ifelse(scenario == "sim3_type4", 0.55, 0.45),
+    seed = seed
+  )
+
+  bulk <- simulate_bulk_from_sc(
+    sc_counts = sc$sc_counts,
+    sc_meta = sc$sc_meta,
+    scenario = scenario,
+    n_patients = 200,
+    cells_per_patient = 400,
+    domain_shift_sd = 1.0,
+    patient_noise_sd = 0.35,
+    seed = seed + 100
+  )
+
+  dir.create(file.path("simulation_results", scenario), recursive = TRUE, showWarnings = FALSE)
+
+  write.csv(sc$sc_counts, file.path("simulation_results", scenario, "sc_counts.csv"))
+  write.csv(sc$sc_meta, file.path("simulation_results", scenario, "sc_meta.csv"), row.names = FALSE)
+  write.csv(bulk$bulk_counts, file.path("simulation_results", scenario, "bulk_counts.csv"))
+  write.csv(
+    data.frame(patient = colnames(bulk$bulk_counts), phenotype = bulk$phenotype),
+    file.path("simulation_results", scenario, "patient_labels.csv"),
+    row.names = FALSE
+  )
+
+  methods <- list(
+    Wasserstein = list(transfer_type = "Wasserstein", lambda3 = 3),
+    MMD = list(transfer_type = "MMD", lambda3 = 3),
+    NoTransfer = list(transfer_type = "Wasserstein", lambda3 = 0)
+  )
+
+  all_scores <- list()
+
+  for (m in names(methods)) {
+    all_scores[[m]] <- run_one_degas_method(
+      sc_counts = sc$sc_counts,
+      sc_meta = sc$sc_meta,
+      bulk_counts = bulk$bulk_counts,
+      phenotype = bulk$phenotype,
+      scenario = scenario,
+      method_name = m,
+      transfer_type = methods[[m]]$transfer_type,
+      lambda3 = methods[[m]]$lambda3,
+      num_layers = num_layers,
+      tot_seeds = tot_seeds
+    )
+
+    gc()
+  }
+
+  do.call(rbind, all_scores)
+}
+```
+
+### run
+```{r}
+dir.create("simulation_results", showWarnings = FALSE)
+dir.create("simulation_runs", showWarnings = FALSE)
+
+scenarios <- c(
+  "sim1_major_type",
+  "sim2_subtype",
+  "sim3_type4"
+)
+
+seeds <- 1:10
+all_score_list <- list()
+counter <- 1
+
+for (sd in seeds) {
+  for (scn in scenarios) {
+    cat("Running simulation seed:", sd, "scenario:", scn, "\n")
+
+    all_score_list[[counter]] <- run_one_scenario(
+      scenario = scn,
+      seed = sd,
+      tot_seeds = 1,   # keep this 1; outer loop already repeats simulation seeds
+      num_layers = 3
+    ) %>%
+      mutate(sim_seed = sd)
+
+    counter <- counter + 1
+    gc()
+  }
+}
+
+score_df <- do.call(rbind, all_score_list)
+
+write.csv(
+  score_df,
+  "simulation_results/simulation_cell_scores.csv",
+  row.names = FALSE
+)
+```
+
+
+```{r}
+metric_df <- score_df %>%
+  group_by(sim_seed, scenario, method) %>%
+  summarise(
+    AUROC = calc_auroc(score, true_risk),
+    AUPRC = calc_auprc(score, true_risk),
+    .groups = "drop"
+  )
+
+top_df <- score_df %>%
+  group_by(sim_seed, scenario, method) %>%
+  group_modify(~ calc_top10_enrichment(.x$score, .x$true_risk)) %>%
+  ungroup()
+
+metric_df <- left_join(
+  metric_df,
+  top_df,
+  by = c("sim_seed", "scenario", "method")
+)
+
+summary_df <- metric_df %>%
+  group_by(scenario, method) %>%
+  summarise(
+    n = n(),
+    mean_AUROC = mean(AUROC, na.rm = TRUE),
+    sd_AUROC = sd(AUROC, na.rm = TRUE),
+    se_AUROC = sd_AUROC / sqrt(n),
+    ci95_AUROC = 1.96 * se_AUROC,
+    mean_AUPRC = mean(AUPRC, na.rm = TRUE),
+    sd_AUPRC = sd(AUPRC, na.rm = TRUE),
+    se_AUPRC = sd_AUPRC / sqrt(n),
+    ci95_AUPRC = 1.96 * se_AUPRC,
+    mean_top10_enrichment = mean(top10_enrichment, na.rm = TRUE),
+    sd_top10_enrichment = sd(top10_enrichment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(metric_df)
+print(summary_df)
+
+write.csv(
+  metric_df,
+  "simulation_results/simulation_metrics_by_seed.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  summary_df,
+  "simulation_results/simulation_metrics_summary.csv",
+  row.names = FALSE
+)
+```
+
+### panel A
+```{r}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+root_dir <- "/N/project/ADNDD/Foundation/DEGAS_torch/simulation"
+setwd(root_dir)
+
+dir.create("simulation_results/sim2_subtype", recursive = TRUE, showWarnings = FALSE)
+dir.create("simulation_figures", recursive = TRUE, showWarnings = FALSE)
+
+remove_umap_outliers <- function(df, group_col = "group", x_col = "UMAP_1", y_col = "UMAP_2",
+                                 cutoff = 3.5) {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    mutate(
+      center_x = median(.data[[x_col]], na.rm = TRUE),
+      center_y = median(.data[[y_col]], na.rm = TRUE),
+      dist_to_center = sqrt((.data[[x_col]] - center_x)^2 + (.data[[y_col]] - center_y)^2),
+      mad_dist = mad(dist_to_center, constant = 1, na.rm = TRUE),
+      med_dist = median(dist_to_center, na.rm = TRUE),
+      keep_cell = dist_to_center <= med_dist + cutoff * mad_dist
+    ) %>%
+    ungroup() %>%
+    filter(keep_cell) %>%
+    select(-center_x, -center_y, -dist_to_center, -mad_dist, -med_dist, -keep_cell)
+}
+
+set.seed(1)
+
+sc <- simulate_sc_counts(
+  scenario = "sim2_subtype",
+  n_genes = 1000,
+  n_cells = 3000,
+  dropout_strength = 0.35,
+  signal_strength = 0.70,
+  seed = 1
+)
+
+sc_counts <- sc$sc_counts
+sc_meta <- sc$sc_meta
+rownames(sc_meta) <- sc_meta$cell
+sc_meta <- sc_meta[colnames(sc_counts), , drop = FALSE]
+
+write.csv(sc_counts, "simulation_results/sim2_subtype/sc_counts.csv")
+write.csv(sc_meta, "simulation_results/sim2_subtype/sc_meta.csv", row.names = FALSE)
+
+seu <- CreateSeuratObject(counts = sc_counts, meta.data = sc_meta)
+
+seu <- NormalizeData(seu, verbose = FALSE)
+seu <- FindVariableFeatures(seu, nfeatures = 2000, verbose = FALSE)
+seu <- ScaleData(seu, verbose = FALSE)
+
+# Panel A emphasizes major cell-type structure.
+# DEGAS training can still use the full expression matrix saved above.
+major_marker_genes <- paste0("Gene", 1:320)
+disease_subtype_genes <- paste0("Gene", 401:500)
+background_genes <- setdiff(VariableFeatures(seu), disease_subtype_genes)
+
+viz_features <- unique(c(major_marker_genes, background_genes))
+viz_features <- setdiff(viz_features, disease_subtype_genes)
+viz_features <- intersect(viz_features, rownames(seu))
+
+seu <- RunPCA(seu, features = viz_features, npcs = 30, verbose = FALSE)
+
+seu <- RunUMAP(
+  seu,
+  dims = 1:12,
+  min.dist = 0.35,
+  spread = 1.2,
+  n.neighbors = 55,
+  verbose = FALSE
+)
+
+umap_df <- as.data.frame(Embeddings(seu, "umap"))
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell <- rownames(umap_df)
+umap_df$group <- seu$group
+umap_df$cellType <- seu$cellType
+umap_df$true_risk <- seu$true_risk
+
+write.csv(
+  umap_df,
+  "simulation_results/sim2_subtype/sc_umap_panel_A_raw_all_cells.csv",
+  row.names = FALSE
+)
+
+umap_df_plot <- remove_umap_outliers(
+  umap_df,
+  group_col = "group",
+  x_col = "UMAP_1",
+  y_col = "UMAP_2",
+  cutoff = 3.5
+)
+
+write.csv(
+  umap_df_plot,
+  "simulation_results/sim2_subtype/sc_umap_panel_A_plot_cells.csv",
+  row.names = FALSE
+)
+
+umap_df_plot$group <- factor(
+  umap_df_plot$group,
+  levels = c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease")
+)
+
+group_cols <- c(
+  "Type1" = "#E64B35",
+  "Type2" = "#4DBBD5",
+  "Type3" = "#00A087",
+  "Type4_normal" = "#2F5597",
+  "Type4_disease" = "#F4A261"
+)
+
+df_other <- umap_df_plot %>%
+  filter(!group %in% c("Type4_normal", "Type4_disease"))
+
+set.seed(22)
+df_type4 <- umap_df_plot %>%
+  filter(group %in% c("Type4_normal", "Type4_disease")) %>%
+  slice_sample(prop = 1)
+
+p_panel_a <- ggplot() +
+  geom_point(
+    data = df_other,
+    aes(x = UMAP_1, y = UMAP_2, color = group),
+    size = 0.85,
+    alpha = 0.90,
+    stroke = 0
+  ) +
+  geom_point(
+    data = df_type4,
+    aes(x = UMAP_1, y = UMAP_2, color = group),
+    size = 0.75,
+    alpha = 0.68,
+    stroke = 0
+  ) +
+  scale_color_manual(
+    values = group_cols,
+    breaks = c("Type1", "Type2", "Type3", "Type4_disease", "Type4_normal"),
+    name = NULL
+  ) +
+  coord_equal() +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  theme_classic(base_size = 18) +
+  theme(
+    axis.title = element_text(size = 24, face = "bold"),
+    axis.text = element_text(size = 18, color = "black"),
+    axis.line = element_line(linewidth = 0.9, color = "black"),
+    axis.ticks = element_line(linewidth = 0.8, color = "black"),
+    legend.position = "right",
+    legend.text = element_text(size = 18),
+    legend.key.size = unit(0.65, "cm"),
+    panel.grid = element_blank(),
+    plot.margin = margin(8, 12, 8, 8)
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(size = 5, alpha = 1),
+      ncol = 1
+    )
+  )
+
+p_panel_a
+
+ggsave(
+  "simulation_figures/Fig_simulation_panel_A_umap.pdf",
+  p_panel_a,
+  width = 7.2,
+  height = 5.4,
+  device = cairo_pdf
+)
+
+ggsave(
+  "simulation_figures/Fig_simulation_panel_A_umap.png",
+  p_panel_a,
+  width = 7.2,
+  height = 5.4,
+  dpi = 600
+)
+
+
+```
+
+### panel B-D
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+root_dir <- "/N/project/ADNDD/Foundation/DEGAS_torch/simulation"
+setwd(root_dir)
+
+dir.create("simulation_figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("simulation_results/composition", recursive = TRUE, showWarnings = FALSE)
+
+group_cols <- c(
+  "Type1" = "#E64B35",
+  "Type2" = "#4DBBD5",
+  "Type3" = "#00A087",
+  "Type4_normal" = "#2F5597",
+  "Type4_disease" = "#F4A261"
+)
+
+make_composition_df <- function(scenario) {
+  if (scenario == "sim1_major_type") {
+    df <- data.frame(
+      patient_status = rep(c("Normal", "Disease"), each = 5),
+      cell_group = rep(c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease"), times = 2),
+      proportion = c(
+        0.25, 0.25, 0.25, 0.25, 0.00,
+        0.50, 1 / 6, 1 / 6, 1 / 6, 0.00
+      )
+    )
+  }
+
+  if (scenario == "sim2_subtype") {
+    df <- data.frame(
+      patient_status = rep(c("Normal", "Disease"), each = 5),
+      cell_group = rep(c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease"), times = 2),
+      proportion = c(
+        0.25, 0.25, 0.25, 0.25, 0.00,
+        0.25, 0.25, 0.25, 0.00, 0.25
+      )
+    )
+  }
+
+  if (scenario == "sim3_type4") {
+    df <- data.frame(
+      patient_status = rep(c("Normal", "Disease"), each = 5),
+      cell_group = rep(c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease"), times = 2),
+      proportion = c(
+        0.25, 0.25, 0.25, 0.25, 0.00,
+        1 / 6, 1 / 6, 1 / 6, 0.30, 0.20
+      )
+    )
+  }
+
+  df$scenario <- scenario
+  df
+}
+
+composition_df <- bind_rows(
+  make_composition_df("sim1_major_type"),
+  make_composition_df("sim2_subtype"),
+  make_composition_df("sim3_type4")
+)
+
+composition_df <- composition_df %>%
+  mutate(
+    patient_status = factor(patient_status, levels = c("Normal", "Disease")),
+    cell_group = factor(
+      cell_group,
+      levels = c("Type1", "Type2", "Type3", "Type4_normal", "Type4_disease")
+    )
+  )
+
+write.csv(
+  composition_df,
+  "simulation_results/composition/simulation_patient_composition_design.csv",
+  row.names = FALSE
+)
+
+plot_composition_panel <- function(df, scenario_id, panel_title) {
+  plot_df <- df %>%
+    filter(scenario == scenario_id)
+
+  ggplot(
+    plot_df,
+    aes(x = patient_status, y = proportion, fill = cell_group)
+  ) +
+    geom_col(width = 0.72, color = "white", linewidth = 0.35) +
+    scale_fill_manual(
+      values = group_cols,
+      drop = FALSE,
+      name = NULL
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = c(0, 0.25, 0.50, 0.75, 1.00),
+      labels = c("0", "0.25", "0.50", "0.75", "1.00"),
+      expand = c(0, 0)
+    ) +
+    labs(
+      title = panel_title,
+      x = NULL,
+      y = "Proportion"
+    ) +
+    theme_classic(base_size = 16) +
+    theme(
+      plot.title = element_text(size = 17, face = "bold", hjust = 0.5),
+      axis.title.y = element_text(size = 17, face = "bold"),
+      axis.text.x = element_text(size = 15, color = "black"),
+      axis.text.y = element_text(size = 14, color = "black"),
+      axis.line = element_line(linewidth = 0.7, color = "black"),
+      axis.ticks = element_line(linewidth = 0.6, color = "black"),
+      legend.position = "none",
+      panel.grid = element_blank(),
+      plot.margin = margin(6, 8, 6, 8)
+    )
+}
+
+p_b <- plot_composition_panel(
+  composition_df,
+  "sim1_major_type",
+  "Simulation 1 patients"
+)
+
+p_c <- plot_composition_panel(
+  composition_df,
+  "sim2_subtype",
+  "Simulation 2 patients"
+)
+
+p_d <- plot_composition_panel(
+  composition_df,
+  "sim3_type4",
+  "Simulation 3 patients"
+)
+
+p_bcd <- p_b + p_c + p_d + plot_layout(nrow = 1)
+
+p_bcd
+
+ggsave(
+  "simulation_figures/Fig_simulation_panels_BCD_patient_composition.pdf",
+  p_bcd,
+  width = 10.5,
+  height = 3.5,
+  device = cairo_pdf
+)
+
+ggsave(
+  "simulation_figures/Fig_simulation_panels_BCD_patient_composition.png",
+  p_bcd,
+  width = 10.5,
+  height = 3.5,
+  dpi = 600
+)
+```
+
+### panel E
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+
+method_order <- c("NoTransfer", "MMD", "Wasserstein")
+method_labels <- c(
+  NoTransfer = "No_transfer",
+  MMD = "MMD",
+  Wasserstein = "Wasserstein"
+)
+
+scenario_order <- c("sim1_major_type", "sim2_subtype", "sim3_type4")
+scenario_labels <- c(
+  sim1_major_type = "Simulation 1",
+  sim2_subtype = "Simulation 2",
+  sim3_type4 = "Simulation 3"
+)
+
+plot_df <- metric_df %>%
+  mutate(
+    method_raw = method,
+    method = factor(method, levels = method_order, labels = method_labels),
+    scenario_raw = scenario,
+    scenario = factor(
+      scenario,
+      levels = scenario_order,
+      labels = scenario_labels
+    )
+  )
+
+auc_wide <- metric_df %>%
+  select(sim_seed, scenario, method, AUROC) %>%
+  pivot_wider(names_from = method, values_from = AUROC)
+
+pair_defs <- data.frame(
+  group1 = c("Wasserstein", "Wasserstein", "MMD"),
+  group2 = c("NoTransfer", "MMD", "NoTransfer"),
+  stringsAsFactors = FALSE
+)
+
+paired_test_one <- function(df, g1, g2) {
+  x <- df[[g1]]
+  y <- df[[g2]]
+  keep <- is.finite(x) & is.finite(y)
+  
+  if (sum(keep) < 2) {
+    return(data.frame(
+      n_pairs = sum(keep),
+      mean_group1 = NA_real_,
+      mean_group2 = NA_real_,
+      mean_diff = NA_real_,
+      p_greater = NA_real_,
+      p_two_sided = NA_real_
+    ))
+  }
+  
+  data.frame(
+    n_pairs = sum(keep),
+    mean_group1 = mean(x[keep], na.rm = TRUE),
+    mean_group2 = mean(y[keep], na.rm = TRUE),
+    mean_diff = mean(x[keep] - y[keep], na.rm = TRUE),
+    p_greater = wilcox.test(
+      x[keep], y[keep],
+      paired = TRUE,
+      exact = FALSE,
+      alternative = "greater"
+    )$p.value,
+    p_two_sided = wilcox.test(
+      x[keep], y[keep],
+      paired = TRUE,
+      exact = FALSE,
+      alternative = "two.sided"
+    )$p.value
+  )
+}
+
+pval_df <- bind_rows(lapply(scenario_order, function(scn) {
+  df_scn <- auc_wide %>% filter(scenario == scn)
+  
+  bind_rows(lapply(seq_len(nrow(pair_defs)), function(i) {
+    g1 <- pair_defs$group1[i]
+    g2 <- pair_defs$group2[i]
+    
+    cbind(
+      data.frame(
+        scenario = scn,
+        group1 = g1,
+        group2 = g2,
+        comparison = paste(g1, ">", g2),
+        stringsAsFactors = FALSE
+      ),
+      paired_test_one(df_scn, g1, g2)
+    )
+  }))
+})) %>%
+  mutate(
+    p_adj_greater = p.adjust(p_greater, method = "BH"),
+    p_adj_two_sided = p.adjust(p_two_sided, method = "BH"),
+    scenario_label = scenario_labels[scenario],
+    group1_label = method_labels[group1],
+    group2_label = method_labels[group2]
+  )
+
+print(pval_df)
+
+setwd("/N/project/ADNDD/Foundation/DEGAS_torch/simulation")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggpubr)
+
+
+
+method_order <- c("NoTransfer", "MMD", "Wasserstein")
+method_labels <- c(
+  NoTransfer = "No_transfer",
+  MMD = "MMD",
+  Wasserstein = "Wasserstein"
+)
+
+scenario_order <- c("sim1_major_type", "sim2_subtype", "sim3_type4")
+scenario_labels <- c(
+  sim1_major_type = "Simulation 1",
+  sim2_subtype = "Simulation 2",
+  sim3_type4 = "Simulation 3"
+)
+
+plot_df <- metric_df %>%
+  mutate(
+    method_raw = method,
+    method = factor(method, levels = method_order, labels = method_labels),
+    scenario_raw = scenario,
+    scenario = factor(scenario, levels = scenario_order, labels = scenario_labels)
+  )
+
+auc_wide <- metric_df %>%
+  select(sim_seed, scenario, method, AUROC) %>%
+  pivot_wider(names_from = method, values_from = AUROC)
+
+pair_defs <- data.frame(
+  group1 = c("Wasserstein", "Wasserstein", "MMD"),
+  group2 = c("NoTransfer", "MMD", "NoTransfer"),
+  stringsAsFactors = FALSE
+)
+
+paired_test_one <- function(df, g1, g2) {
+  x <- df[[g1]]
+  y <- df[[g2]]
+  keep <- is.finite(x) & is.finite(y)
+  
+  if (sum(keep) < 2) {
+    return(data.frame(
+      n_pairs = sum(keep),
+      mean_group1 = NA_real_,
+      mean_group2 = NA_real_,
+      mean_diff = NA_real_,
+      p_greater = NA_real_,
+      p_two_sided = NA_real_
+    ))
+  }
+  
+  data.frame(
+    n_pairs = sum(keep),
+    mean_group1 = mean(x[keep], na.rm = TRUE),
+    mean_group2 = mean(y[keep], na.rm = TRUE),
+    mean_diff = mean(x[keep] - y[keep], na.rm = TRUE),
+    p_greater = wilcox.test(
+      x[keep], y[keep],
+      paired = TRUE,
+      exact = FALSE,
+      alternative = "greater"
+    )$p.value,
+    p_two_sided = wilcox.test(
+      x[keep], y[keep],
+      paired = TRUE,
+      exact = FALSE,
+      alternative = "two.sided"
+    )$p.value
+  )
+}
+
+pval_df <- bind_rows(lapply(scenario_order, function(scn) {
+  df_scn <- auc_wide %>% filter(scenario == scn)
+  
+  bind_rows(lapply(seq_len(nrow(pair_defs)), function(i) {
+    g1 <- pair_defs$group1[i]
+    g2 <- pair_defs$group2[i]
+    
+    cbind(
+      data.frame(
+        scenario_raw = scn,
+        group1_raw = g1,
+        group2_raw = g2,
+        comparison = paste(g1, ">", g2),
+        stringsAsFactors = FALSE
+      ),
+      paired_test_one(df_scn, g1, g2)
+    )
+  }))
+})) %>%
+  mutate(
+    p_adj_greater = p.adjust(p_greater, method = "BH"),
+    p_adj_two_sided = p.adjust(p_two_sided, method = "BH"),
+    scenario = factor(scenario_labels[scenario_raw], levels = scenario_labels),
+    group1 = factor(method_labels[group1_raw], levels = method_labels[method_order]),
+    group2 = factor(method_labels[group2_raw], levels = method_labels[method_order])
+  )
+
+print(pval_df)
+
+write.csv(
+  pval_df,
+  "simulation_results/simulation_AUROC_all_pairwise_pvalues.csv",
+  row.names = FALSE
+)
+
+p_to_star <- function(p) {
+  ifelse(
+    is.na(p), NA_character_,
+    ifelse(
+      p < 0.001, "***",
+      ifelse(
+        p < 0.01, "**",
+        ifelse(p < 0.05, "*", "ns")
+      )
+    )
+  )
+}
+
+panel_y <- plot_df %>%
+  group_by(scenario_raw) %>%
+  summarise(
+    y_base = max(AUROC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+annot_df <- pval_df %>%
+  filter(
+    group1_raw == "Wasserstein",
+    group2_raw %in% c("NoTransfer", "MMD"),
+    mean_diff > 0,
+    p_adj_greater < 0.05
+  ) %>%
+  group_by(scenario_raw) %>%
+  arrange(group2_raw, .by_group = TRUE) %>%
+  mutate(
+    y.position = 0.975 + 0.025 * row_number(),
+    label = p_to_star(p_adj_greater)
+  ) %>%
+  ungroup()
+
+p_auc <- ggplot(plot_df, aes(x = method, y = AUROC, color = method)) +
+  geom_jitter(width = 0.12, height = 0, size = 3.0, alpha = 0.9) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 4.6,
+    color = "black"
+  ) +
+  stat_summary(
+    fun.data = mean_cl_normal,
+    geom = "errorbar",
+    width = 0.22,
+    linewidth = 0.8,
+    color = "black"
+  )
+
+if (nrow(annot_df) > 0) {
+  p_auc <- p_auc +
+    ggpubr::stat_pvalue_manual(
+      annot_df,
+      label = "label",
+      xmin = "group2",
+      xmax = "group1",
+      y.position = "y.position",
+      tip.length = 0.01,
+      bracket.size = 0.7,
+      size = 7,
+      inherit.aes = FALSE
+    )
+}
+
+p_auc <- p_auc +
+  facet_wrap(~ scenario, nrow = 1) +
+  scale_color_manual(
+    values = c(
+      No_transfer = "#7A7A7A",
+      MMD = "#3B82F6",
+      Wasserstein = "#D73027"
+    )
+  ) +
+  scale_y_continuous(
+    breaks = seq(0.7, 1, 0.1),
+    expand = expansion(mult = c(0.02, 0.2))
+  ) +
+  coord_cartesian(
+    ylim = c(0.7, 1),
+    clip = "off"
+  ) +
+  theme_bw(base_size = 18) +
+  labs(
+    x = NULL,
+    y = "Cell-level AUROC",
+    color = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 17),
+    axis.title.y = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 15, angle = 35, hjust = 1, color = "black"),
+    axis.text.y = element_text(size = 16, color = "black"),
+    strip.text = element_text(size = 18, face = "bold"),
+    strip.background = element_rect(fill = "gray95", color = "gray60", linewidth = 0.8),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.35),
+    panel.border = element_rect(color = "black", linewidth = 0.8),
+    plot.margin = margin(35, 10, 8, 10)
+  )
+
+ggsave(
+  "simulation_results/simulation_AUROC_by_seed_significant_only.pdf",
+  p_auc,
+  width = 12,
+  height = 6,
+  device = cairo_pdf
+)
+
+ggsave(
+  "simulation_results/simulation_AUROC_by_seed_significant_only.png",
+  p_auc,
+  width = 12,
+  height = 6,
+  dpi = 600
+)
+
+```

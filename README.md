@@ -6,11 +6,13 @@
 
 **Ziyu Liu**
 
-**Travis S. Johnson (https://github.com/tsteelejohnson91)**
+**Jiahui Liu (https://github.com/ElliotLiu1997)**
 
 **Sihong Li (https://github.com/alanli97)**
 
-**Jiahui Liu (https://github.com/ElliotLiu1997)**
+**Travis S. Johnson (https://github.com/tsteelejohnson91)**
+
+**Current maintenance and updates are managed by Jiahui Liu ([https://github.com/ElliotLiu1997](https://github.com/ElliotLiu1997)).**
 
 ## Installation
 
