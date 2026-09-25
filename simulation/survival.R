@@ -86,20 +86,35 @@ rownames(filtered_degs) <- filtered_degs$Gene
 cat("Number of filtered sc marker genes:", nrow(filtered_degs), "\n")
 
 ############################################################
-## Select fixed survival genes using binary 3-year PFS
+## Select survival genes using binary 3-year PFS
 ############################################################
 
-binary_label <- (phenotype$time < 3 * 365) * phenotype$status + 1
+# binary_label <- (phenotype$time < 3 * 365) * phenotype$status + 1
+horizon <- 3 * 365
+
+known_3y <- (phenotype$status == 1 & phenotype$time < horizon) |
+  (phenotype$time >= horizon)
+
+binary_label <- ifelse(
+  phenotype$status == 1 & phenotype$time < horizon,
+  1,
+  0
+)
+
+cat("Known 3-year patients:", sum(known_3y), "\n")
+cat("Excluded early-censored:", sum(!known_3y), "\n")
+print(table(binary_label[known_3y]))
+
 
 bulk_counts <- bulk_dataset
 bulk_counts[bulk_counts < 0] <- 0
 bulk_counts <- apply(bulk_counts, c(1, 2), as.integer)
 
 dds <- DESeqDataSetFromMatrix(
-  countData = bulk_counts,
+  countData = bulk_counts[, known_3y],
   colData = data.frame(
-    id = colnames(bulk_dataset),
-    label = as.factor(binary_label)
+    id = colnames(bulk_dataset)[known_3y],
+    label = as.factor(binary_label[known_3y])
   ),
   design = ~label
 )
@@ -175,8 +190,8 @@ norm_out <- normalize_counts_with_selected_genes(
 )
 
 binary_data <- list(
-  patDat = norm_out$patDat,
-  phenotype = binary_label - 1,
+  patDat = norm_out$patDat[known_3y, , drop = FALSE],
+  phenotype = binary_label[known_3y],
   scstDat = norm_out$scstDat,
   st_names_list = norm_out$scstName,
   sclab = as.integer(as.factor(sc_dataset@meta.data$seurat_clusters)) - 1
@@ -209,11 +224,11 @@ n_st_classes <- length(unique(binary_data$sclab))
 
 ## Dry run:
 tot_seeds_use <- 1
-tot_iters_use <- 50
+tot_iters_use <- 500
 
 ## Final run:
-tot_seeds_use <- 10
-tot_iters_use <- 500
+#tot_seeds_use <- 10
+#tot_iters_use <- 500
 
 n_st_classes <- length(unique(binary_data$sclab))
 checkpoint_root <- "/N/project/ADNDD/Foundation/DEGAS_torch/simulation/survival"
@@ -605,4 +620,67 @@ ggsave(
   height = 5,
   dpi = 600
 )
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+umap_df <- as.data.frame(Embeddings(sc_dataset, reduction = "umap"))
+colnames(umap_df)[1:2] <- c("UMAP_1", "UMAP_2")
+umap_df$index <- seq_len(nrow(umap_df)) - 1  # DEGAS index is 0-based
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+umap_df <- as.data.frame(Embeddings(sc_dataset, reduction = "umap"))
+colnames(umap_df)[1:2] <- c("UMAP_1", "UMAP_2")
+umap_df$index <- seq_len(nrow(umap_df)) - 1
+
+plot_one_umap <- function(degas_result, title) {
+  plot_df <- umap_df %>%
+    left_join(
+      degas_result %>%
+        select(index, hazard) %>%
+        mutate(`Progression Association` = hazard * 2 - 1),
+      by = "index"
+    )
+  
+  ggplot(plot_df, aes(UMAP_1, UMAP_2)) +
+    geom_point(aes(color = `Progression Association`), size = 0.25, alpha = 0.8) +
+    scale_color_gradient2(
+      low = "#8DB4D2",
+      mid = "#D9D9D9",
+      high = "#D73027",
+      midpoint = 0,
+      limits = c(-1, 1),
+      name = "Progression\nAssociation"
+    ) +
+    coord_equal() +
+    labs(
+      title = title,
+      x = "UMAP 1",
+      y = "UMAP 2"
+    ) +
+    theme_classic(base_size = 16) +
+    theme(
+      plot.title = element_text(size = 18, hjust = 0.5),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 14),
+      axis.line = element_line(color = "black", linewidth = 0.5),
+      axis.ticks = element_line(color = "black", linewidth = 0.5),
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+}
+
+p_binary <- plot_one_umap(degas_binary, "Binary PFS")
+p_logneg <- plot_one_umap(degas_logneg, "Cox log-neg")
+p_rank   <- plot_one_umap(degas_rank, "Cox rank-loss")
+
+ggsave(file.path(results_dir, "survival_umap_binary_pfs.png"), p_binary, width = 5.5, height = 4.5, dpi = 300)
+ggsave(file.path(results_dir, "survival_umap_cox_logneg.png"), p_logneg, width = 5.5, height = 4.5, dpi = 300)
+ggsave(file.path(results_dir, "survival_umap_cox_rankloss.png"), p_rank, width = 5.5, height = 4.5, dpi = 300)
+
+
 
